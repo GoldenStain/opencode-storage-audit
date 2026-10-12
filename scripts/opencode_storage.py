@@ -45,16 +45,26 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser(
         "audit", parents=[common], help="read-only storage and database report"
     )
-    audit.add_argument("--top", type=int, default=15, help="sessions to list (default: 15)")
+    audit.add_argument(
+        "--top", type=int, default=15, help="sessions to list (default: 15)"
+    )
     audit.add_argument(
         "--oversized-mib",
         type=float,
         default=10.0,
         help="message size warning threshold in MiB (default: 10)",
     )
+    audit.add_argument(
+        "--session",
+        metavar="ID",
+        default=None,
+        help="show a focused report for one session by full id or unique prefix",
+    )
 
     cleanup = subparsers.add_parser(
-        "cleanup", parents=[common], help="back up, optionally clean, and VACUUM the database"
+        "cleanup",
+        parents=[common],
+        help="back up, optionally clean, and VACUUM the database",
     )
     cleanup.add_argument(
         "--clear-events",
@@ -77,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="report what would change without modifying anything",
     )
+    cleanup.add_argument(
+        "--backup",
+        action="store_true",
+        help="decide whether to backup database and orphan-diffs",
+    )
     return parser
 
 
@@ -95,12 +110,18 @@ def main(argv=None) -> int:
             )
             return 1
         report = storage_audit.build_report(
-            data_dir, top=args.top, oversized_mib=args.oversized_mib
+            data_dir,
+            top=args.top,
+            oversized_mib=args.oversized_mib,
+            session=args.session,
         )
         if use_json:
             print(json.dumps(report, indent=2, ensure_ascii=False))
         else:
             storage_audit.render_report(report, console)
+        detail = report.get("session_detail")
+        if args.session and detail is not None and not detail.get("found"):
+            return 1
         return 0
 
     if args.command == "cleanup":
@@ -112,6 +133,7 @@ def main(argv=None) -> int:
                 delete_orphan_diffs=args.delete_orphan_diffs,
                 backup_dir=args.backup_dir,
                 dry_run=args.dry_run,
+                to_backup=args.backup,
             )
         except storage_cleanup.CleanupError as error:
             storage_render.Console(stream=sys.stderr).error(f"error: {error}")

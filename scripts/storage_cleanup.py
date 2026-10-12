@@ -20,7 +20,9 @@ def _timestamp() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
-def _backup_database(db_path: Path, backup: Path) -> None:
+def _backup_database(db_path: Path, backup: Path, to_backup: bool) -> None:
+    if not to_backup:
+        return
     source = storage_db.connect_readonly(db_path)
     destination = sqlite3.connect(backup)
     try:
@@ -34,15 +36,18 @@ def _backup_database(db_path: Path, backup: Path) -> None:
         raise CleanupError(f"backup integrity_check failed: {check}")
 
 
-def _archive_and_remove(paths: list[Path], archive: Path) -> None:
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
-        for path in paths:
-            output.write(path, arcname=path.name)
-    with zipfile.ZipFile(archive) as verify:
-        if verify.testzip() is not None:
-            raise CleanupError(f"orphan diff archive failed verification: {archive}")
-        if len(verify.namelist()) != len(paths):
-            raise CleanupError(f"orphan diff archive count mismatch: {archive}")
+def _archive_and_remove(paths: list[Path], archive: Path, to_backup: bool) -> None:
+    if to_backup:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            for path in paths:
+                output.write(path, arcname=path.name)
+        with zipfile.ZipFile(archive) as verify:
+            if verify.testzip() is not None:
+                raise CleanupError(
+                    f"orphan diff archive failed verification: {archive}"
+                )
+            if len(verify.namelist()) != len(paths):
+                raise CleanupError(f"orphan diff archive count mismatch: {archive}")
     for path in paths:
         path.unlink()
 
@@ -52,19 +57,32 @@ def build_plan(
 ) -> dict:
     """Describe what cleanup would remove, without modifying anything."""
     plan = {
-        "db_bytes": artifacts.db_path.stat().st_size if artifacts.db_path.is_file() else 0,
-        "wal_bytes": artifacts.wal_path.stat().st_size if artifacts.wal_path.exists() else 0,
+        "db_bytes": artifacts.db_path.stat().st_size
+        if artifacts.db_path.is_file()
+        else 0,
+        "wal_bytes": artifacts.wal_path.stat().st_size
+        if artifacts.wal_path.exists()
+        else 0,
         "freelist_bytes": 0,
         "clear_events": {"enabled": bool(clear_events), "rows": 0, "bytes": 0},
-        "orphan_diffs": {"enabled": bool(delete_orphan_diffs), "count": 0, "bytes": 0, "files": []},
+        "orphan_diffs": {
+            "enabled": bool(delete_orphan_diffs),
+            "count": 0,
+            "bytes": 0,
+            "files": [],
+        },
         "estimated_reclaim_bytes": 0,
     }
 
     if artifacts.db_path.is_file():
         connection = storage_db.connect_readonly(artifacts.db_path)
         try:
-            plan["freelist_bytes"] = storage_db.page_metrics(connection)["freelist_bytes"]
-            live_sessions = {row[0] for row in connection.execute("SELECT id FROM session")}
+            plan["freelist_bytes"] = storage_db.page_metrics(connection)[
+                "freelist_bytes"
+            ]
+            live_sessions = {
+                row[0] for row in connection.execute("SELECT id FROM session")
+            }
             if clear_events and storage_db.table_exists(connection, "event"):
                 plan["clear_events"]["rows"] = storage_db.scalar(
                     connection, "SELECT COUNT(*) FROM event"
@@ -83,7 +101,9 @@ def build_plan(
             ]
             plan["orphan_diffs"]["files"] = [path.name for path in orphan_paths]
             plan["orphan_diffs"]["count"] = len(orphan_paths)
-            plan["orphan_diffs"]["bytes"] = sum(path.stat().st_size for path in orphan_paths)
+            plan["orphan_diffs"]["bytes"] = sum(
+                path.stat().st_size for path in orphan_paths
+            )
 
     plan["estimated_reclaim_bytes"] = (
         plan["freelist_bytes"]
@@ -99,6 +119,7 @@ def run(
     delete_orphan_diffs: bool,
     backup_dir: Path,
     dry_run: bool = False,
+    to_backup: bool = False,
 ) -> dict:
     """Back up the database, optionally clean it, and VACUUM it back to the filesystem."""
     processes = storage_env.running_processes()
@@ -112,7 +133,9 @@ def run(
         }
 
     if processes:
-        detail = "\n".join(f"  PID {entry['pid']}: {entry['command']}" for entry in processes)
+        detail = "\n".join(
+            f"  PID {entry['pid']}: {entry['command']}" for entry in processes
+        )
         raise CleanupError(
             "OpenCode is running; VACUUM requires exclusive access.\n"
             f"{detail}\nExit every OpenCode serve/attach process, then run this command again."
@@ -126,7 +149,7 @@ def run(
     stamp = _timestamp()
     backup = backup_dir / f"opencode.db.pre-cleanup-{stamp}.bak"
     before = artifacts.db_path.stat().st_size
-    _backup_database(artifacts.db_path, backup)
+    _backup_database(artifacts.db_path, backup, to_backup)
 
     events = {"deleted": False, "rows": 0, "bytes": 0}
     live_sessions: set[str] = set()
@@ -163,21 +186,26 @@ def run(
     orphans = {"deleted": False, "count": 0, "bytes": 0, "archive": None}
     if delete_orphan_diffs and artifacts.diff_dir.is_dir():
         orphan_paths = [
-            path for path in artifacts.diff_dir.glob("*.json") if path.stem not in live_sessions
+            path
+            for path in artifacts.diff_dir.glob("*.json")
+            if path.stem not in live_sessions
         ]
         if orphan_paths:
             archive = backup_dir / f"opencode-orphan-session-diffs-{stamp}.zip"
             bytes_total = sum(path.stat().st_size for path in orphan_paths)
-            _archive_and_remove(orphan_paths, archive)
+            _archive_and_remove(orphan_paths, archive, to_backup)
             orphans = {
                 "deleted": True,
                 "count": len(orphan_paths),
                 "bytes": bytes_total,
-                "archive": str(archive),
+                "archive": str(archive) if to_backup else "None",
             }
 
     after = artifacts.db_path.stat().st_size
     wal_after = artifacts.wal_path.stat().st_size if artifacts.wal_path.exists() else 0
+
+    backup_bytes = backup.stat().st_size if to_backup else 0
+
     return {
         "dry_run": False,
         "before_bytes": before,
@@ -185,7 +213,7 @@ def run(
         "wal_bytes": wal_after,
         "reclaimed_bytes": before - after,
         "backup_path": str(backup),
-        "backup_bytes": backup.stat().st_size,
+        "backup_bytes": backup_bytes,
         "events": events,
         "orphans": orphans,
         "integrity": integrity,
@@ -194,7 +222,10 @@ def run(
 
 
 def render_plan(
-    plan: dict, processes: list[dict[str, str]], backup_dir: str, console: render.Console
+    plan: dict,
+    processes: list[dict[str, str]],
+    backup_dir: str,
+    console: render.Console,
 ) -> None:
     console.section("Preflight")
     if processes:
@@ -299,5 +330,7 @@ def render_result(result: dict, console: render.Console) -> None:
     )
     console.write("")
     console.write(
-        console.dim("  delete the backup only after OpenCode starts and retained sessions open")
+        console.dim(
+            "  delete the backup only after OpenCode starts and retained sessions open"
+        )
     )

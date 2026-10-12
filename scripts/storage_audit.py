@@ -11,10 +11,86 @@ import storage_env
 import storage_render as render
 
 
+MESSAGE_DETAIL_LIMIT = 50
+
+
 def _format_date(milliseconds) -> str:
     if not milliseconds:
         return "unknown"
     return datetime.datetime.fromtimestamp(milliseconds / 1000).strftime("%Y-%m-%d")
+
+
+def _amount(count: int, size: int) -> str:
+    """Render a row count and its byte size as one compact cell."""
+    return f"{render.human_count(count)} · {render.human_bytes(size)}"
+
+
+def _resolve_session(sessions: list[dict], query: str) -> tuple[dict | None, list[dict]]:
+    """Match a session by exact id or unique prefix, returning it plus any ambiguity."""
+    exact = [session for session in sessions if session["id"] == query]
+    if exact:
+        return exact[0], []
+    matches = [session for session in sessions if session["id"].startswith(query)]
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
+
+
+def _session_detail(connection: sqlite3.Connection, session: dict) -> dict:
+    """Collect metadata and the largest messages for one session."""
+    session_id = session["id"]
+    row = connection.execute(
+        "SELECT id, title, directory, project_id, parent_id, time_created, "
+        "time_updated, time_archived FROM session WHERE id=?",
+        (session_id,),
+    ).fetchone()
+    (
+        _id,
+        title,
+        directory,
+        project_id,
+        parent_id,
+        created,
+        updated,
+        archived,
+    ) = row
+
+    messages = [
+        {
+            "id": message_id,
+            "bytes": size or 0,
+            "parts": parts,
+            "created": _format_date(message_created),
+        }
+        for message_id, size, message_created, parts in connection.execute(
+            "SELECT m.id, LENGTH(m.data), m.time_created, "
+            "(SELECT COUNT(*) FROM part p WHERE p.message_id=m.id) "
+            "FROM message m WHERE m.session_id=? ORDER BY LENGTH(m.data) DESC",
+            (session_id,),
+        )
+    ]
+
+    return {
+        "found": True,
+        "id": session_id,
+        "title": (title or "").replace("\n", " ").strip(),
+        "directory": directory or "",
+        "project_id": project_id or "",
+        "parent_id": parent_id or "",
+        "created": _format_date(created),
+        "updated": _format_date(updated),
+        "archived": _format_date(archived) if archived else "",
+        "message_count": session["message_count"],
+        "message_bytes": session["message_bytes"],
+        "part_count": session["part_count"],
+        "part_bytes": session["part_bytes"],
+        "event_count": session["event_count"],
+        "event_bytes": session["event_bytes"],
+        "diff_bytes": session["diff_bytes"],
+        "total_bytes": session["total_bytes"],
+        "messages": messages[:MESSAGE_DETAIL_LIMIT],
+        "message_limit": MESSAGE_DETAIL_LIMIT,
+    }
 
 
 def _database_report(connection: sqlite3.Connection) -> dict:
@@ -122,7 +198,7 @@ def _session_report(connection: sqlite3.Connection, artifacts: storage_env.Artif
 
 
 def build_report(
-    data_dir: Path, top: int = 15, oversized_mib: float = 10.0
+    data_dir: Path, top: int = 15, oversized_mib: float = 10.0, session: str | None = None
 ) -> dict:
     """Collect storage, database, and session metadata without reading content."""
     artifacts = storage_env.Artifacts(data_dir)
@@ -140,6 +216,8 @@ def build_report(
         "oversized_mib": oversized_mib,
         "sessions": [],
         "session_count": 0,
+        "session_query": session or "",
+        "session_detail": None,
         "oversized_messages": [],
         "orphan_diffs": {"count": 0, "bytes": 0, "files": []},
         "events": {"present": False, "count": 0, "bytes": 0, "orphan_count": 0, "orphan_bytes": 0},
@@ -157,6 +235,20 @@ def build_report(
         sessions, live_sessions = _session_report(connection, artifacts)
         report["session_count"] = len(sessions)
         report["sessions"] = sessions[:top]
+
+        if session:
+            matched, matches = _resolve_session(sessions, session)
+            if matched is not None:
+                report["session_detail"] = _session_detail(connection, matched)
+            else:
+                report["session_detail"] = {
+                    "found": False,
+                    "query": session,
+                    "matches": [
+                        {"id": item["id"], "title": item["title"]}
+                        for item in matches[:10]
+                    ],
+                }
 
         threshold = int(oversized_mib * 1024 * 1024)
         report["oversized_messages"] = [
@@ -216,6 +308,63 @@ def build_report(
         "files": tool_files[:10],
     }
     return report
+
+
+def _render_session_detail(report: dict, console: render.Console) -> None:
+    """Write the focused single-session view selected by --session."""
+    detail = report["session_detail"]
+    console.section("Session detail")
+    if not detail.get("found"):
+        console.warning(f"  no session matching {detail['query']!r}")
+        if detail["matches"]:
+            console.write(console.dim("  prefix matches:"))
+            for item in detail["matches"]:
+                title = render.truncate(item["title"], 46) or "(untitled)"
+                console.write(f"    {item['id']}  {title}")
+        return
+
+    console.line("id", detail["id"])
+    console.line("title", render.truncate(detail["title"], 60) or "(untitled)")
+    console.line("directory", detail["directory"] or "-")
+    if detail["parent_id"]:
+        console.line("parent", detail["parent_id"])
+    if detail["project_id"]:
+        console.line("project", detail["project_id"])
+    console.line("created", detail["created"])
+    console.line("updated", detail["updated"])
+    if detail["archived"]:
+        console.line("archived", detail["archived"])
+    console.line("messages", _amount(detail["message_count"], detail["message_bytes"]))
+    console.line("parts", _amount(detail["part_count"], detail["part_bytes"]))
+    console.line("events", _amount(detail["event_count"], detail["event_bytes"]))
+    console.line("diffs", render.human_bytes(detail["diff_bytes"]))
+    console.line("total", console.bold(render.human_bytes(detail["total_bytes"])))
+
+    messages = detail["messages"]
+    header = (
+        f"Largest messages (top {len(messages)} of "
+        f"{render.human_count(detail['message_count'])})"
+    )
+    console.section(header)
+    if messages:
+        table = render.Table(
+            [
+                ("size", "right", "yellow"),
+                ("parts", "right", ""),
+                ("created", "left", "dim"),
+                ("message", "left", ""),
+            ]
+        )
+        for item in messages:
+            table.add(
+                render.human_bytes(item["bytes"]),
+                render.human_count(item["parts"]),
+                item["created"],
+                item["id"],
+            )
+        table.write(console)
+    else:
+        console.write("  " + console.dim("none"))
 
 
 def render_report(report: dict, console: render.Console) -> None:
@@ -291,6 +440,17 @@ def render_report(report: dict, console: render.Console) -> None:
             objects.write(console)
 
     sessions = report["sessions"]
+    detail = report.get("session_detail")
+    if detail is not None:
+        _render_session_detail(report, console)
+        console.write("")
+        console.write(
+            console.dim(
+                "  DELETE only frees pages; run cleanup with OpenCode stopped to VACUUM them back."
+            )
+        )
+        return
+
     if sessions:
         console.section(f"Largest sessions (top {len(sessions)} of {report['session_count']})")
         largest = max(session["total_bytes"] for session in sessions) or 1
@@ -299,9 +459,9 @@ def render_report(report: dict, console: render.Console) -> None:
                 ("#", "right", "dim"),
                 ("size", "right", "bold"),
                 ("bar", "left", "cyan"),
-                ("msg", "right", ""),
-                ("part", "right", ""),
-                ("event", "right", ""),
+                ("msgs", "right", ""),
+                ("parts", "right", ""),
+                ("events", "right", ""),
                 ("diff", "right", ""),
                 ("updated", "left", "dim"),
                 ("session", "left", ""),
@@ -313,9 +473,9 @@ def render_report(report: dict, console: render.Console) -> None:
                 index,
                 render.human_bytes(session["total_bytes"]),
                 render.bar(session["total_bytes"] / largest),
-                render.human_bytes(session["message_bytes"]),
-                render.human_bytes(session["part_bytes"]),
-                render.human_bytes(session["event_bytes"]),
+                _amount(session["message_count"], session["message_bytes"]),
+                _amount(session["part_count"], session["part_bytes"]),
+                _amount(session["event_count"], session["event_bytes"]),
                 render.human_bytes(session["diff_bytes"]),
                 session["updated"],
                 render.truncate(session["title"], 46) or "(untitled)",
